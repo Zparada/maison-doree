@@ -15,7 +15,7 @@ const SCHEMA = {
   cash:     {sheet:'Caja',      cols:[['id','ID','t'],['date','Fecha','t'],['open','Efectivo inicial','n']]},
   clients:  {sheet:'Clientes',  cols:[['id','ID','t'],['name','Nombre','t'],['phone','Celular','t'],['bday','Nacimiento','t'],['note','Notas','t']]},
   inventory:{sheet:'Inventario',cols:[['id','ID','t'],['name','Producto','t'],['qty','Cantidad','n'],['min','Mínimo','n'],['cost','Costo','n']]},
-  expenses: {sheet:'Gastos',    cols:[['id','ID','t'],['date','Fecha','t'],['concept','Concepto','t'],['amt','Valor','n'],['cat','Categoría','t']]},
+  expenses: {sheet:'Gastos',    cols:[['id','ID','t'],['date','Fecha','t'],['concept','Concepto','t'],['amt','Valor','n'],['cat','Categoría','t'],['method','Medio (cash/tr)','t']]},
   appts:    {sheet:'Citas',     cols:[['id','ID','t'],['date','Fecha','t'],['time','Hora','t'],['emp','ID empleada','t'],['empName','Empleada','t'],['client','Cliente','t'],['svc','Servicio','t'],['status','Estado','t'],['note','Nota','t']]},
   goals:    {sheet:'Metas',     cols:[['id','Mes','t'],['meta','Meta','n']]},
   config:   {sheet:'Config',    cols:[['id','Clave','t'],['value','Valor','t']]}
@@ -56,6 +56,18 @@ function upsert(col, rec){
   r.setValues([s.cols.map(c=>rec[c[0]]===undefined?'':rec[c[0]])]);
 }
 function removeRow(col, id){ const w = sh(col), r = findRow(w,id); if (r) w.deleteRow(r); }
+
+/** Si el esquema cambia (columnas nuevas), actualiza los encabezados SIN tocar los datos. */
+const SCHEMA_V = '2';
+function ensureHeaders(){
+  const P = PropertiesService.getScriptProperties();
+  if (P.getProperty('schemaV') === SCHEMA_V) return;
+  Object.keys(SCHEMA).forEach(col => {
+    const s = SCHEMA[col], w = sh(col);
+    w.getRange(1,1,1,s.cols.length).setValues([s.cols.map(c=>c[1])]).setFontWeight('bold').setBackground('#f1e6e8');
+  });
+  P.setProperty('schemaV', SCHEMA_V);
+}
 
 /* ---------- seguridad ---------- */
 function hash(salt, pass){
@@ -147,7 +159,10 @@ function doPut(u, col, rec){
   }
   if (WITH_EMP.includes(col) && out.emp) { const e = rows('users').find(x => x.id===out.emp); out.empName = e ? e.name : ''; }
   upsert(col, out);
-  if (col==='sales' && !old) adjustInv(out.svc, -1);
+  if (col==='sales') {
+    if (!old) adjustInv(out.svc, -1);
+    else if (old.svc !== out.svc) { adjustInv(old.svc, +1); adjustInv(out.svc, -1); }
+  }
   const res = {ok:true, rec:strip(out)};
   if (col==='sales' && u.role==='owner') res.inv = rows('inventory');
   return res;
@@ -165,7 +180,7 @@ function doDel(u, col, id){
 function route(r){
   if (r.a==='login') return login(r.name, r.pass);
   const u = auth(r.t);
-  if (r.a==='load') return {ok:true, user:pub(u), data:loadFor(u)};
+  if (r.a==='load') { ensureHeaders(); return {ok:true, user:pub(u), data:loadFor(u)}; }
   if (r.a==='pw') {
     if (String(r.pass||'').length < 6) throw new Error('La clave debe tener mínimo 6 caracteres');
     const l = LockService.getScriptLock(); l.waitLock(25000);

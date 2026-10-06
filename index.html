@@ -113,10 +113,30 @@ async function del(col,id){
 const isOwner=()=>me&&me.role==='owner',isEmp=()=>me&&me.role==='emp';
 const emps=all=>db.users.filter(u=>u.role==='emp'&&(all||u.active));
 const uname=id=>(db.users.find(u=>u.id===id)||{name:'—'}).name;
-const openOf=d=>+(db.cash.find(c=>c.id===d)||{}).open||0;
+/* Acumulado día a día: el efectivo y las transferencias de un día pasan al siguiente.
+   Si hay un "efectivo inicial" escrito a mano para un día, ese valor reemplaza al automático. */
+let ver=0,rcache=null;
+function runMap(){
+  if(rcache&&rcache.v===ver)return rcache.m;
+  const A={},g=d=>A[d]||(A[d]={ci:0,ti:0,cp:0,tp:0,ce:0,te:0,open:null});
+  db.sales.forEach(s=>{const a=g(s.date);s.method==='cash'?a.ci+=+s.price:a.ti+=+s.price});
+  db.pays.forEach(p=>{const a=g(p.date);p.method==='cash'?a.cp+=+p.amt:a.tp+=+p.amt});
+  db.expenses.forEach(e=>{const a=g(e.date);e.method==='tr'?a.te+=+e.amt:a.ce+=+e.amt});
+  db.cash.forEach(c=>{g(c.date).open=+c.open||0});
+  const m={};let rc=0,rt=0;
+  Object.keys(A).sort().forEach(d=>{const a=A[d],startC=a.open!==null?a.open:rc,prevT=rt;
+    rc=startC+a.ci-a.cp-a.ce;rt=rt+a.ti-a.tp-a.te;
+    m[d]={startC,prevT,endC:rc,endT:rt,auto:a.open===null}});
+  rcache={v:ver,m};return m;
+}
+function dayState(d){
+  const R=runMap();if(R[d])return R[d];
+  const ks=Object.keys(R).filter(k=>k<d).sort(),l=ks.length?R[ks[ks.length-1]]:null;
+  return{startC:l?l.endC:0,prevT:l?l.endT:0,endC:l?l.endC:0,endT:l?l.endT:0,auto:true};
+}
 const noteOf=(d,e)=>(db.notes.find(n=>n.id===d+'|'+e)||{}).note||'';
 function calc(d){
-  const sales=db.sales.filter(s=>s.date===d),pays=db.pays.filter(p=>p.date===d),open=openOf(d);
+  const sales=db.sales.filter(s=>s.date===d),pays=db.pays.filter(p=>p.date===d),exps=db.expenses.filter(e=>e.date===d),st=dayState(d);
   const cash=sum(sales.filter(s=>s.method==='cash'),'price'),tr=sum(sales.filter(s=>s.method==='tr'),'price');
   const rows=db.users.filter(u=>u.role==='emp').map(u=>{
     const my=sales.filter(s=>s.emp===u.id),pp=pays.filter(p=>p.emp===u.id);
@@ -125,7 +145,9 @@ function calc(d){
     return{u,n:my.length,sv,due,pc,pt,paid:pc+pt,pend:due-pc-pt,pays:pp,note:noteOf(d,u.id),pct:my[0]?my[0].pct:u.pct};
   }).filter(r=>r.u.active||r.n||r.paid);
   const cashPaid=sum(rows,'pc'),trPaid=sum(rows,'pt');
-  return{sales,cash,tr,rows,open,cashBox:open+cash-cashPaid,trLeft:tr-trPaid,due:sum(rows,'due'),paid:sum(rows,'paid'),pend:sum(rows,'pend')};
+  const expC=sum(exps.filter(e=>e.method!=='tr'),'amt'),expT=sum(exps.filter(e=>e.method==='tr'),'amt');
+  return{sales,exps,cash,tr,rows,open:st.startC,openAuto:st.auto,trPrev:st.prevT,cashPaid,trPaid,expC,expT,
+    cashBox:st.endC,trLeft:st.endT,due:sum(rows,'due'),paid:sum(rows,'paid'),pend:sum(rows,'pend')};
 }
 const balance=id=>Math.round(db.sales.filter(s=>s.emp===id).reduce((t,s)=>t+s.price*s.pct/100,0)-sum(db.pays.filter(p=>p.emp===id),'amt'));
 function month(m){
@@ -145,12 +167,17 @@ function report(d){
     if(r.pend)L.push(` ➡️ Pendiente por pagar: ${money(r.pend)}`);
     if(r.note)L.push(` 📝 ${r.note}`);
   });
-  L.push('👥 TOTAL EMPLEADOS',`💰 Total correspondiente a empleados: ${money(c.due)}`,` 💵 Pagado hoy: ${money(c.paid)}`,` 📌 Pendiente: ${money(c.pend)}`,'','───','',
-   '💵 CIERRE DE CAJA EN EFECTIVO',`💰 Efectivo inicial: ${money(c.open)}`,` ➕ Efectivo recibido por servicios: ${money(c.cash)}`,` = ${money(c.open+c.cash)}`);
+  L.push('👥 TOTAL EMPLEADOS',`💰 Total correspondiente a empleados: ${money(c.due)}`,` 💵 Pagado hoy: ${money(c.paid)}`,` 📌 Pendiente: ${money(c.pend)}`,'','───','');
+  if(c.exps.length){L.push('💸 GASTOS DEL DÍA');c.exps.forEach(e=>L.push(`➖ ${e.concept}: ${money(e.amt)} (${e.method==='tr'?'transferencia':'efectivo'})`));L.push('','───','')}
+  L.push('💵 CIERRE DE CAJA EN EFECTIVO',`💰 Efectivo inicial: ${money(c.open)}`,` ➕ Efectivo recibido por servicios: ${money(c.cash)}`,` = ${money(c.open+c.cash)}`);
   c.rows.filter(r=>r.pc).forEach(r=>L.push(`➖ Pago a ${r.u.name}: ${money(r.pc)}`));
-  L.push(`🔐 EFECTIVO QUE DEBE QUEDAR EN CAJA: ${money(c.cashBox)}`,'','───','','💳 TRANSFERENCIAS',`💳 Transferencias recibidas: ${money(c.tr)}`);
+  if(c.expC)L.push(`➖ Gastos en efectivo: ${money(c.expC)}`);
+  L.push(`🔐 EFECTIVO QUE DEBE QUEDAR EN CAJA: ${money(c.cashBox)}`,'','───','','💳 TRANSFERENCIAS');
+  if(c.trPrev)L.push(`💳 Transferencias de días anteriores: ${money(c.trPrev)}`);
+  L.push(`💳 Transferencias recibidas hoy: ${money(c.tr)}`);
   c.rows.filter(r=>r.pt).forEach(r=>L.push(` ➖ ${r.u.name}: ${money(r.pt)}`));
-  L.push(`💳 Transferencias que quedan para el salón: ${money(c.trLeft)}`,'','───','','👑 RESUMEN FINAL DEL SALÓN',
+  if(c.expT)L.push(`➖ Gastos por transferencia: ${money(c.expT)}`);
+  L.push(`💳 Transferencias que quedan para el salón (acumulado): ${money(c.trLeft)}`,'','───','','👑 RESUMEN FINAL DEL SALÓN',
    `💵 Efectivo en caja: ${money(c.cashBox)}`,` 💳 Transferencias restantes: ${money(c.trLeft)}`,`💰 TOTAL DISPONIBLE DEL SALÓN: ${money(c.cashBox+c.trLeft)}`);
   c.rows.filter(r=>r.pend>0).forEach(r=>L.push(`📌 Pendiente por pagar a ${r.u.name}: ${money(r.pend)}`));
   return L.join('\n');
@@ -205,6 +232,7 @@ const TABS=()=>isEmp()?[['hoy','✂️','Hoy'],['agenda','📅','Agenda'],['mis'
   [['resumen','📊','Resumen'],['hoy','✂️','Servicios'],['cierre','🧾','Cierre'],['agenda','📅','Agenda'],['clientes','👤','Clientes'],['gastos','🧮','Gastos'],['servicios','💅','Precios'],['inv','📦','Inventario'],...(isOwner()?[['equipo','👥','Equipo'],['datos','☁️','Datos']]:[])];
 function render(){
   if(!db||!me)return;
+  ver++;
   const t=TABS();if(!t.find(x=>x[0]===view))view=t[0][0];
   const V={resumen:vResumen,hoy:vHoy,cierre:vCierre,mis:vMis,agenda:vAgenda,clientes:vClientes,gastos:vGastos,servicios:vServicios,inv:vInv,equipo:vEquipo,datos:vDatos}[view]();
   const sc=window.scrollY;
@@ -224,7 +252,7 @@ function vResumen(){
   const bd=db.clients.filter(x=>x.bday&&x.bday.slice(5,7)===m.slice(5)).sort((a,b)=>a.bday.slice(8)-b.bday.slice(8));
   const low=db.inventory.filter(i=>i.qty<=i.min),debts=emps(true).map(u=>({u,b:balance(u.id)})).filter(x=>x.b);
   const pc=goal?Math.min(100,Math.round(M.inc/goal*100)):0;
-  return dateBar()+`<h2>Resumen del ${fdate(curDate)}</h2>`+kpis(c)+`<div class="kpis"><div class="kpi"><span>🔐 Efectivo en caja</span><b>${money(c.cashBox)}</b></div><div class="kpi"><span>Total disponible</span><b>${money(c.cashBox+c.trLeft)}</b></div><div class="kpi"><span>Pendiente empleados</span><b>${money(c.pend)}</b></div></div>
+  return dateBar()+`<h2>Resumen del ${fdate(curDate)}</h2>`+kpis(c)+`<div class="kpis"><div class="kpi"><span>🔐 Efectivo en caja</span><b>${money(c.cashBox)}</b></div><div class="kpi"><span>💳 Transferencias acumuladas</span><b>${money(c.trLeft)}</b></div><div class="kpi"><span>Total disponible</span><b>${money(c.cashBox+c.trLeft)}</b></div><div class="kpi"><span>Pendiente empleados</span><b>${money(c.pend)}</b></div></div>
   <div class="card"><div class="between"><h3>Mes ${m.split('-').reverse().join('/')}</h3>${isOwner()?'<button class="sm" data-a="goal">🎯 Meta</button>':''}</div>
   <div class="li"><span>Ingresos por servicios</span><b>${money(M.inc)}</b></div><div class="li"><span>− Comisiones empleadas</span><b>${money(M.com)}</b></div><div class="li"><span>− Gastos del salón</span><b>${money(M.gas)}</b></div><div class="li"><b>✨ Ganancia real</b><b class="${M.net<0?'bad':'ok'}">${money(M.net)}</b></div>
   ${goal?`<div class="bar"><i style="width:${pc}%"></i></div><div class="mut">Meta ${money(goal)} · llevas ${pc}% · faltan ${money(Math.max(0,goal-M.inc))}</div>`:'<p class="mut" style="margin:6px 0 0">Aún no hay meta para este mes.</p>'}</div>
@@ -245,7 +273,7 @@ function vHoy(){
   if(isEmp()){const r=c.rows.find(x=>x.u.id===me.id)||{sv:0,due:0,paid:0,note:''};
     top=`<div class="kpis"><div class="kpi"><span>Mis servicios hoy</span><b>${money(r.sv)}</b></div><div class="kpi"><span>Mi ${me.pct}%</span><b>${money(r.due)}</b></div><div class="kpi"><span>Ya me pagaron</span><b>${money(r.paid)}</b></div></div>${r.note?`<div class="card">📝 ${esc(r.note)}</div>`:''}`}
   else top=kpis(c);
-  return dateBar()+top+form+`<div class="card"><h3>Servicios del día (${mine.length})</h3>${mine.map(s=>`<div class="li"><div>${esc(s.name)}<div class="mut">${esc(uname(s.emp))} · ${s.method==='cash'?'💵':'💳'}${s.client?' · '+esc(s.client):''}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><b>${money(s.price)}</b>${canAdd&&(isOwner()||s.by===me.id)?`<button class="sm del" data-a="delSale" data-id="${s.id}">✕</button>`:''}</div></div>`).join('')||'<p class="mut">Aún no hay servicios.</p>'}</div>`;
+  return dateBar()+top+form+`<div class="card"><h3>Servicios del día (${mine.length})</h3>${mine.map(s=>`<div class="li"><div>${esc(s.name)}<div class="mut">${esc(uname(s.emp))} · ${s.method==='cash'?'💵':'💳'}${s.client?' · '+esc(s.client):''}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><b>${money(s.price)}</b>${isOwner()?`<button class="sm" data-a="editSale" data-id="${s.id}">✎</button>`:''}${canAdd&&(isOwner()||s.by===me.id)?`<button class="sm del" data-a="delSale" data-id="${s.id}">✕</button>`:''}</div></div>`).join('')||'<p class="mut">Aún no hay servicios.</p>'}</div>`;
 }
 function bindHoy(){
   const fs=$('#fs');if(!fs)return;
@@ -261,10 +289,14 @@ function vMis(){
 function vCierre(){
   const c=calc(curDate),ro=!isOwner(),kind={pago:'Pago',adelanto:'Adelanto',prestamo:'Préstamo'};
   return dateBar()+`<h2>Cierre del día</h2>${kpis(c)}
-  <div class="card between"><h3 style="margin:0">💰 Efectivo inicial de caja</h3>${ro?`<b>${money(c.open)}</b>`:`<input id="op" inputmode="numeric" value="${c.open}" style="max-width:140px;text-align:right">`}</div>
+  <div class="card"><div class="between"><h3 style="margin:0">💰 Efectivo inicial de caja</h3>${ro?`<b>${money(c.open)}</b>`:`<input id="op" inputmode="numeric" value="${c.open}" style="max-width:140px;text-align:right">`}</div>
+   <div class="mut">${c.openAuto?'Automático: viene del efectivo que quedó en caja el día anterior.':'Escrito a mano para este día.'}${!c.openAuto&&!ro?' <button class="sm" data-a="autoOpen">Usar el del día anterior</button>':''}</div>
+   <div class="between" style="margin-top:8px"><span>💳 Transferencias de días anteriores</span><b>${money(c.trPrev)}</b></div></div>
+  <div class="card"><div class="between"><h3 style="margin:0">💸 Gastos del día</h3>${ro?'':'<button class="sm pri" data-a="newExp">+ Gasto</button>'}</div>
+   ${c.exps.map(e=>`<div class="li"><div>${esc(e.concept)}<div class="mut">${e.method==='tr'?'💳 Transferencia':'💵 Efectivo'} · ${esc(e.cat||'Otros')}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><b>${money(e.amt)}</b>${ro?'':`<button class="sm" data-a="editExp" data-id="${e.id}">✎</button><button class="sm del" data-a="delExp" data-id="${e.id}">✕</button>`}</div></div>`).join('')||'<p class="mut" style="margin:6px 0 0">Sin gastos este día.</p>'}</div>
   ${c.rows.map(r=>`<div class="card"><div class="between"><h3 style="margin:0">${esc(r.u.name)} <span class="tag">${r.pct}%</span></h3><b>${money(r.due)}</b></div>
    <div class="mut">Servicios: ${r.n} · ${money(r.sv)}</div>
-   ${r.pays.map(p=>`<div class="li"><span>${p.method==='cash'?'💵':'💳'} ${kind[p.kind]||'Pago'}${p.note?' · '+esc(p.note):''}</span><span><b>${money(p.amt)}</b> ${ro?'':`<button class="sm del" data-a="delPay" data-id="${p.id}">✕</button>`}</span></div>`).join('')}
+   ${r.pays.map(p=>`<div class="li"><span>${p.method==='cash'?'💵':'💳'} ${kind[p.kind]||'Pago'}${p.note?' · '+esc(p.note):''}</span><span><b>${money(p.amt)}</b> ${ro?'':`<button class="sm" data-a="editPay" data-id="${p.id}">✎</button><button class="sm del" data-a="delPay" data-id="${p.id}">✕</button>`}</span></div>`).join('')}
    <div class="between" style="margin-top:6px"><b class="${r.pend>0?'bad':'ok'}">${r.pend>0?'Pendiente: '+money(r.pend):r.pend<0?'Pagado de más: '+money(-r.pend):'Pagado ✓'}</b><span class="mut">Saldo acumulado: ${money(balance(r.u.id))}</span></div>
    ${r.note?`<div class="mut">📝 ${esc(r.note)}</div>`:''}
    <div class="row" style="margin-top:8px">${ro?'':`<button class="sm pri" data-a="pay" data-id="${r.u.id}">+ Pago / adelanto</button><button class="sm" data-a="note" data-id="${r.u.id}">📝 Nota</button>`}<button class="sm gold" data-a="wsEmp" data-id="${r.u.id}">WhatsApp</button></div></div>`).join('')}
@@ -272,7 +304,7 @@ function vCierre(){
 }
 function vAgenda(){
   const l=db.appts.filter(a=>a.date===curDate).sort((a,b)=>a.time.localeCompare(b.time)),can=me.role!=='viewer';
-  return dateBar()+`<div class="between"><h2>Agenda ${fdate(curDate)}</h2>${can?'<button class="pri" data-a="newAppt">+ Cita</button>':''}</div><div class="card">${l.map(a=>`<div class="li"><div><b>${esc(a.time)}</b> ${esc(a.client)}<div class="mut">${esc(a.svc)} · ${esc(uname(a.emp))}${a.note?' · '+esc(a.note):''}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><span class="tag">${esc(a.status||'pendiente')}</span>${can?`<button class="sm" data-a="stAppt" data-id="${a.id}">↻</button><button class="sm del" data-a="delAppt" data-id="${a.id}">✕</button>`:''}</div></div>`).join('')||'<p class="mut">Sin citas este día.</p>'}</div>`;
+  return dateBar()+`<div class="between"><h2>Agenda ${fdate(curDate)}</h2>${can?'<button class="pri" data-a="newAppt">+ Cita</button>':''}</div><div class="card">${l.map(a=>`<div class="li"><div><b>${esc(a.time)}</b> ${esc(a.client)}<div class="mut">${esc(a.svc)} · ${esc(uname(a.emp))}${a.note?' · '+esc(a.note):''}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><span class="tag">${esc(a.status||'pendiente')}</span>${can?`<button class="sm" data-a="stAppt" data-id="${a.id}">↻</button><button class="sm" data-a="editAppt" data-id="${a.id}">✎</button><button class="sm del" data-a="delAppt" data-id="${a.id}">✕</button>`:''}</div></div>`).join('')||'<p class="mut">Sin citas este día.</p>'}</div>`;
 }
 function vClientes(){
   return`<h2>Clientes</h2><div class="card"><div class="row"><input id="qc" placeholder="Buscar nombre o celular" oninput="filtC()">${me.role!=='viewer'?'<button class="pri" data-a="newCli">+ Nuevo</button>':''}</div></div><div class="card" id="cl2">${listC('')}</div>`;
@@ -284,7 +316,7 @@ function vGastos(){
   const m=curDate.slice(0,7),M=month(m),o=isOwner(),cats={};M.ex.forEach(e=>cats[e.cat||'Otros']=(cats[e.cat||'Otros']||0)+e.amt);
   return dateBar()+`<div class="between"><h2>Gastos del mes</h2>${o?'<button class="pri" data-a="newExp">+ Gasto</button>':''}</div>
   <div class="kpis"><div class="kpi"><span>Ingresos</span><b>${money(M.inc)}</b></div><div class="kpi"><span>Comisiones</span><b>${money(M.com)}</b></div><div class="kpi"><span>Gastos</span><b>${money(M.gas)}</b></div><div class="kpi"><span>✨ Ganancia real</span><b class="${M.net<0?'bad':'ok'}">${money(M.net)}</b></div></div>
-  <div class="card">${M.ex.sort((a,b)=>a.date<b.date?1:-1).map(e=>`<div class="li"><div>${esc(e.concept)}<div class="mut">${fdate(e.date)} · ${esc(e.cat||'Otros')}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><b>${money(e.amt)}</b>${o?`<button class="sm del" data-a="delExp" data-id="${e.id}">✕</button>`:''}</div></div>`).join('')||'<p class="mut">Sin gastos este mes.</p>'}</div>`;
+  <div class="card">${M.ex.sort((a,b)=>a.date<b.date?1:-1).map(e=>`<div class="li"><div>${esc(e.concept)}<div class="mut">${fdate(e.date)} · ${e.method==='tr'?'💳 Transferencia':'💵 Efectivo'} · ${esc(e.cat||'Otros')}</div></div><div class="row" style="flex:0;flex-wrap:nowrap"><b>${money(e.amt)}</b>${o?`<button class="sm" data-a="editExp" data-id="${e.id}">✎</button><button class="sm del" data-a="delExp" data-id="${e.id}">✕</button>`:''}</div></div>`).join('')||'<p class="mut">Sin gastos este mes.</p>'}</div>`;
 }
 function vServicios(){
   const cats=[...new Set(db.services.map(s=>s.cat))],o=isOwner();
@@ -334,8 +366,20 @@ const A={
  invP:id=>{const i=db.inventory.find(x=>x.id===id);put('inventory',{...i,qty:i.qty+1})},
  invM:id=>{const i=db.inventory.find(x=>x.id===id);put('inventory',{...i,qty:Math.max(0,i.qty-1)})},
  newUser:()=>userModal(),editUser:id=>userModal(db.users.find(u=>u.id===id)),
- newExp:()=>modal('Nuevo gasto',[{k:'concept',label:'Concepto (arriendo, productos…)'},{k:'amt',label:'Valor',m:'numeric'},{k:'cat',label:'Categoría',type:'select',value:'Productos',options:['Arriendo','Productos','Servicios públicos','Publicidad','Mantenimiento','Otros'].map(x=>[x,x])},{k:'date',label:'Fecha',type:'date',value:curDate}],o=>{
-   if(!o.concept.trim()||!num(o.amt))return false;put('expenses',{id:uid(),date:o.date||curDate,concept:o.concept.trim(),amt:num(o.amt),cat:o.cat})}),
+ newExp:()=>expModal(),editExp:id=>expModal(db.expenses.find(e=>e.id===id)),
+ autoOpen:()=>{db.cash=db.cash.filter(c=>c.id!==curDate);del('cash',curDate)},
+ editSale:id=>{const s=db.sales.find(x=>x.id===id);
+  modal('Editar servicio',[{k:'emp',label:'Empleada',type:'select',value:s.emp,options:emps(true).map(u=>[u.id,u.name])},
+   {k:'svc',label:'Servicio',type:'select',value:s.svc,options:[...(db.services.some(x=>x.id===s.svc)?[]:[[s.svc,s.name+' (eliminado)']]),...db.services.map(x=>[x.id,x.name+' — '+money(x.price)])]},
+   {k:'price',label:'Valor cobrado',m:'numeric',value:s.price},{k:'method',label:'Pago',type:'select',value:s.method,options:[['cash','💵 Efectivo'],['tr','💳 Transferencia']]},{k:'client',label:'Cliente',value:s.client,list:'cl'},{k:'date',label:'Fecha',type:'date',value:s.date}],o=>{
+   if(!num(o.price))return false;const sv=db.services.find(x=>x.id===o.svc),u=db.users.find(x=>x.id===o.emp);
+   put('sales',{...s,emp:o.emp,empName:u.name,pct:o.emp===s.emp?s.pct:u.pct,svc:o.svc,name:sv?sv.name:s.name,price:num(o.price),method:o.method,client:o.client.trim(),date:o.date||s.date})})},
+ editPay:id=>{const p=db.pays.find(x=>x.id===id);
+  modal('Editar pago a '+uname(p.emp),[{k:'amt',label:'Valor',m:'numeric',value:p.amt},{k:'kind',label:'Tipo',type:'select',value:p.kind||'pago',options:[['pago','Pago de comisión'],['adelanto','Adelanto'],['prestamo','Préstamo']]},{k:'method',label:'Medio',type:'select',value:p.method,options:[['cash','💵 Efectivo'],['tr','💳 Transferencia']]},{k:'note',label:'Nota',value:p.note}],o=>{
+   if(!num(o.amt))return false;put('pays',{...p,amt:num(o.amt),kind:o.kind,method:o.method,note:o.note})})},
+ editAppt:id=>{const a=db.appts.find(x=>x.id===id);
+  modal('Editar cita',[{k:'date',label:'Fecha',type:'date',value:a.date},{k:'time',label:'Hora',type:'time',value:a.time},...(isEmp()?[]:[{k:'emp',label:'Empleada',type:'select',value:a.emp,options:emps(true).map(u=>[u.id,u.name])}]),{k:'client',label:'Cliente',value:a.client,list:'cl'},{k:'svc',label:'Servicio',value:a.svc,list:'sl'},{k:'note',label:'Nota',value:a.note}],o=>{
+   if(!o.client.trim())return false;const e=o.emp||a.emp;put('appts',{...a,date:o.date||a.date,time:o.time,emp:e,empName:uname(e),client:o.client.trim(),svc:o.svc,note:o.note})})},
  delExp:id=>{if(confirm('¿Eliminar gasto?'))del('expenses',id)},
  goal:()=>{const m=curDate.slice(0,7);modal('Meta de ingresos '+m.split('-').reverse().join('/'),[{k:'g',label:'Meta del mes ($)',m:'numeric',value:(db.goals.find(g=>g.id===m)||{}).meta||''}],o=>{put('goals',{id:m,meta:num(o.g)})})},
  newAppt:()=>modal('Nueva cita',[{k:'time',label:'Hora',type:'time',value:'09:00'},...(isEmp()?[]:[{k:'emp',label:'Empleada',type:'select',options:emps().map(u=>[u.id,u.name])}]),{k:'client',label:'Cliente',list:'cl'},{k:'svc',label:'Servicio',list:'sl'},{k:'note',label:'Nota',value:''}],o=>{
@@ -356,6 +400,11 @@ const A={
   XLSX.writeFile(wb,'salon-'+today()+'.xlsx');
  }
 };
+function expModal(e){e=e||{};
+  modal(e.id?'Editar gasto':'Nuevo gasto',[{k:'concept',label:'Concepto (arriendo, productos…)',value:e.concept},{k:'amt',label:'Valor',m:'numeric',value:e.amt},
+   {k:'method',label:'¿De dónde salió la plata?',type:'select',value:e.method||'cash',options:[['cash','💵 Efectivo de la caja'],['tr','💳 Transferencia']]},
+   {k:'cat',label:'Categoría',type:'select',value:e.cat||'Productos',options:['Arriendo','Productos','Servicios públicos','Publicidad','Mantenimiento','Otros'].map(x=>[x,x])},{k:'date',label:'Fecha',type:'date',value:e.date||curDate}],o=>{
+   if(!o.concept.trim()||!num(o.amt))return false;put('expenses',{...e,id:e.id||uid(),date:o.date||curDate,concept:o.concept.trim(),amt:num(o.amt),cat:o.cat,method:o.method})})}
 function cliModal(c){c=c||{};modal(c.id?'Editar cliente':'Nuevo cliente',[{k:'name',label:'Nombre',value:c.name},{k:'phone',label:'Celular',m:'tel',value:c.phone},{k:'bday',label:'Fecha de nacimiento',type:'date',value:c.bday},{k:'note',label:'Notas',type:'textarea',value:c.note}],o=>{
   if(!o.name.trim())return false;put('clients',{...c,...o,id:c.id||uid()})})}
 function svcModal(s){s=s||{};const[ui,uq]=(s.uses||'').split(';')[0].split(':');
